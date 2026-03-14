@@ -2,80 +2,102 @@ import os
 import sys
 import subprocess
 import threading
+import docker
+from dotenv import load_dotenv
 
-def read_process_output(process, sid, socketio, running_processes):
-    """Reads stdout/stderr and emits to client."""
+load_dotenv()
+
+def read_process_output(process, log_callback):
+    """
+    Reads process output and sends it to a callback function 
+    instead of emitting via SocketIO.
+    """
     try:
         for line in iter(process.stdout.readline, b''):
             decoded_line = line.decode('utf-8', errors='replace')
-            socketio.emit('terminal_output', {'text': decoded_line}, room=sid)
+            # The log_callback is a function passed from app.py 
+            # that updates st.session_state.terminal_logs
+            log_callback(decoded_line)
         
         process.stdout.close()
         process.wait()
-        socketio.emit('terminal_output', {'text': f"\n[Process finished with exit code {process.returncode}]\n"}, room=sid)
         
-        if sid in running_processes:
-            del running_processes[sid]
+        exit_code = process.returncode
+        log_callback(f"\n[Process finished with exit code {exit_code}]\n")
             
     except Exception as e:
-        socketio.emit('terminal_output', {'text': f"\n[Error reading output: {str(e)}]\n"}, room=sid)
+        log_callback(f"\n[Error reading output: {str(e)}]\n")
 
-def execute_code_interactive(full_path, sid, socketio, running_processes):
-    """Executes code (Docker for Python, Local for C++/Java)."""
+def execute_code_interactive(full_path, log_callback):
+    """
+    Executes code and uses a callback to handle terminal logs.
+    """
     file_name = os.path.basename(full_path)
     file_extension = os.path.splitext(file_name)[1].lower()
     cmd = []
     cwd = os.path.dirname(full_path)
 
-    # --- DOCKER LOGIC FOR PYTHON ---
     if file_extension == '.py':
+        try:
+            client = docker.from_env()
+            client.ping()
+        except Exception:
+            log_callback("❌ Docker Error: Daemon not found. Ensure Docker Desktop is running.\n")
+            return
+
         abs_path = os.path.abspath(full_path)
         cmd = [
             'docker', 'run', '--rm', '-i', 
             '-v', f'{abs_path}:/app/{file_name}', 
-            '-w', '/app', 'python:3.9-slim', 
+            '-w', '/app', 'python:3.10-slim', 
             'python', '-u', file_name
         ]
-        cwd = None # Docker manages context
-        socketio.emit('terminal_output', {'text': f"[🔒 Securing Environment...]\n[🐳 Starting Docker Container...]\n"}, room=sid)
+        cwd = None 
+        log_callback(f"[🔒 Securing Environment...]\n[🐳 Starting Docker Container (Python 3.10)...]\n")
 
-    # --- LOCAL LOGIC FOR C++/JAVA ---
     elif file_extension in ['.c', '.cpp']:
         compiler = 'g++' if file_extension == '.cpp' else 'gcc'
         exe_name = os.path.splitext(full_path)[0]
         if os.name == 'nt': exe_name += ".exe"
         
-        socketio.emit('terminal_output', {'text': f"[Compiling {file_name}...]\n"}, room=sid)
-        compile_process = subprocess.run([compiler, full_path, '-o', exe_name], capture_output=True, text=True)
+        log_callback(f"[Compiling {file_name}...]\n")
+        compile_res = subprocess.run([compiler, full_path, '-o', exe_name], capture_output=True, text=True)
         
-        if compile_process.returncode != 0:
-            socketio.emit('terminal_output', {'text': f"Compilation Failed:\n{compile_process.stderr}\n"}, room=sid)
+        if compile_res.returncode != 0:
+            log_callback(f"Compilation Failed:\n{compile_res.stderr}\n")
             return
             
         cmd = [exe_name]
-        if os.name != 'nt' and '/' not in exe_name: cmd = ['./' + os.path.basename(exe_name)]
+        if os.name != 'nt' and '/' not in exe_name: 
+            cmd = ['./' + os.path.basename(exe_name)]
 
     elif file_extension == '.java':
+        log_callback(f"[Starting JVM for {file_name}...]\n")
         cmd = ['java', full_path]
-
     else:
-        socketio.emit('terminal_output', {'text': "Unsupported file type.\n"}, room=sid)
+        log_callback(f"Unsupported file type: {file_extension}\n")
         return
 
-    # Start Process
     try:
         process = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, bufsize=0
+            cmd, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT,
+            cwd=cwd, 
+            bufsize=0
         )
-        running_processes[sid] = process
         
-        thread = threading.Thread(target=read_process_output, args=(process, sid, socketio, running_processes))
+        # Start background thread to read output
+        thread = threading.Thread(
+            target=read_process_output, 
+            args=(process, log_callback)
+        )
         thread.daemon = True
         thread.start()
         
-        status_msg = f"[Running {file_name} in Sandbox]\n" if file_extension == '.py' else f"[Started {file_name} Locally]\n"
-        socketio.emit('terminal_output', {'text': status_msg}, room=sid)
+        return process # Return the process so app.py can manage it (kill/input)
 
     except Exception as e:
-        socketio.emit('terminal_output', {'text': f"Error starting process: {str(e)}\nMake sure Docker is running!"}, room=sid)
+        log_callback(f"Error starting process: {str(e)}\n")
+        return None
