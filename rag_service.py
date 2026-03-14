@@ -1,139 +1,115 @@
 import os
-import google.generativeai as genai
+import time
+import faiss
+import numpy as np
 from PIL import Image
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
+import google.generativeai as genai
 
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-import time
-import google.generativeai as genai
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# Use dedicated models for embeddings and generation
+EMBED_MODEL = "models/embedding-001"
+CHAT_MODEL = genai.GenerativeModel('gemini-2.5-flash')
+
+# --- Multimodal Summarization (Direct Gemini SDK) ---
 
 def summarize_multimodal(file_path):
-    """
-    Summarizes Text, PDF, Video, Audio, or Images using Gemini's File API.
-    """
+    """Summarizes Text, PDF, Video, Audio, or Images using Gemini's File API."""
     print(f"🚀 AI Uploading: {file_path}")
     
-    # 1. Upload file to Gemini File API
-    # This is necessary for videos/audio to be 'watched' by the AI
+    # 1. Upload to Gemini File API
     myfile = genai.upload_file(path=file_path)
     
-    # 2. Wait for processing (Crucial for Video)
-    # Gemini needs a few seconds to 'index' the video frames
+    # 2. Handle processing states (Required for video/audio)
     while myfile.state.name == "PROCESSING":
-        print("⏳ Waiting for video processing...")
+        print("⏳ Waiting for processing...")
         time.sleep(3)
         myfile = genai.get_file(myfile.name)
 
     if myfile.state.name == "FAILED":
-        raise ValueError("AI failed to process the video file.")
+        raise ValueError("AI failed to process the file.")
 
-    # 3. Use the 2.5-flash-lite model to summarize
-    model = genai.GenerativeModel('gemini-2.5-flash-lite')
-    
-    response = model.generate_content([
+    # 3. Generate summary
+    response = CHAT_MODEL.generate_content([
         myfile, 
-        "\n\nTask: Provide a detailed summary of this file. "
-        "If it's a video, explain the visual events and any audio/speech. "
-        "If it's an image, describe it. If it's a document, list key points."
+        "\n\nTask: Provide a detailed summary. Describe visual events for video, "
+        "details for images, or key points for documents."
     ])
-
     return response.text
 
-# Configure GenAI for summarization tasks
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# --- Framework-Free RAG Implementation ---
 
-def summarize_content_with_gemini(text_content):
-    """Summarizes text content using Gemini."""
-    if not GEMINI_API_KEY:
-        return "Error: GEMINI_API_KEY not found."
-    
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash-lite')
-        prompt = f"""
-        You are a helpful assistant. Please provide a concise but comprehensive 
-        summary of the following content. 
+class VectorStore:
+    """A lightweight FAISS wrapper to replace LangChain vector stores."""
+    def __init__(self):
+        self.index = None
+        self.chunks = []
+
+    def add_texts(self, texts):
+        self.chunks = texts
+        # Generate embeddings directly via Google SDK
+        result = genai.embed_content(
+            model=EMBED_MODEL,
+            content=texts,
+            task_type="retrieval_document"
+        )
+        embeddings = np.array(result['embedding']).astype('float32')
         
-        - If it is code, explain what it does.
-        - If it is a transcript, summarize the main discussion points.
+        # Initialize and build FAISS index
+        dimension = embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(embeddings)
+
+    def similarity_search(self, query, k=3):
+        # Embed the query
+        query_embedding = genai.embed_content(
+            model=EMBED_MODEL,
+            content=query,
+            task_type="retrieval_query"
+        )['embedding']
         
-        Content:
-        {text_content[:30000]} 
-        """
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Gemini Summarization Error: {str(e)}"
-
-# In services/rag_service.py
-
-def summarize_image_with_gemini(full_path):
-    """Analyzes an image file and returns a text description."""
-    if not GEMINI_API_KEY:
-        return {"status": "error", "message": "GEMINI_API_KEY not found."}
-
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash-lite')
-        img = Image.open(full_path)
-        # We use a 'describe' style prompt here
-        prompt = "Describe this image in detail. Mention objects, colors, and the overall context."
-        
-        response = model.generate_content([prompt, img])
-
-        return {
-            "status": "success", 
-            "text_content": response.text,
-            "message": "Image description complete."
-        }
-    except Exception as e:
-        return {"status": "error", "message": f"Gemini Vision Error: {str(e)}"}
+        # Search index
+        distances, indices = self.index.search(np.array([query_embedding]).astype('float32'), k)
+        return [self.chunks[i] for i in indices[0]]
 
 def build_rag_index(text_content):
-    """Creates a FAISS Vector Store from text."""
-    if not text_content or not GEMINI_API_KEY: 
+    """Creates a vector store index from text content."""
+    if not text_content:
         return None
     
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_text(text_content)
-        
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
-        vector_store = FAISS.from_texts(chunks, embedding=embeddings)
-        return vector_store
-    except Exception as e:
-        print(f"RAG Build Error: {e}")
-        return None
+    # Split text into chunks manually
+    chunk_size = 1000
+    chunks = [text_content[i:i + chunk_size] for i in range(0, len(text_content), 800)]
+    
+    v_store = VectorStore()
+    v_store.add_texts(chunks)
+    return v_store
 
 def query_rag_document(query, vector_store):
-    """Queries the vector store."""
+    """Queries the framework-free vector store and generates an answer."""
     if not vector_store:
         return "No document is currently indexed."
 
-    try:
-        docs = vector_store.similarity_search(query, k=3)
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", google_api_key=GEMINI_API_KEY, temperature=0.3)
-        
-        prompt_template = """
-        Answer the question as detailed as possible from the provided context.
-        If the answer is not in the context, just say "answer is not available in the context".
-        
-        Context:
-        {context}
-        
-        Question: 
-        {question}
-        
-        Answer:
-        """
-        prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-        chain = load_qa_chain(llm, chain_type="stuff", prompt=prompt)
-        response = chain({"input_documents": docs, "question": query}, return_only_outputs=True)
-        return response["output_text"]
-    except Exception as e:
-        return f"RAG Query Error: {e}"
+    # Retrieve context
+    relevant_chunks = vector_store.similarity_search(query, k=3)
+    context = "\n".join(relevant_chunks)
+    
+    # Generate response with provided context
+    prompt = f"""
+    Answer the question as detailed as possible from the provided context.
+    If the answer is not in the context, say "answer is not available in the context".
+    
+    Context:
+    {context}
+    
+    Question: 
+    {query}
+    """
+    response = CHAT_MODEL.generate_content(prompt)
+    return response.text
