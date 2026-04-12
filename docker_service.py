@@ -28,15 +28,20 @@ def read_process_output(process, log_callback):
     except Exception as e:
         log_callback(f"\n[Error reading output: {str(e)}]\n")
 
-def execute_code_interactive(full_path, log_callback):
+def execute_code_interactive(full_path, sid, socketio, running_processes):
     """
-    Executes code and uses a callback to handle terminal logs.
+    Executes code and uses socketio to handle terminal logs for a specific session.
     """
+    # Create a helper function to send logs back to the specific user via SocketIO
+    def log_callback(message):
+        socketio.emit('terminal_output', {'text': message}, room=sid)
+
     file_name = os.path.basename(full_path)
     file_extension = os.path.splitext(file_name)[1].lower()
     cmd = []
     cwd = os.path.dirname(full_path)
 
+    # --- PYTHON (DOCKER) ---
     if file_extension == '.py':
         try:
             client = docker.from_env()
@@ -55,6 +60,7 @@ def execute_code_interactive(full_path, log_callback):
         cwd = None 
         log_callback(f"[🔒 Securing Environment...]\n[🐳 Starting Docker Container (Python 3.10)...]\n")
 
+    # --- C / C++ (LOCAL COMPILATION) ---
     elif file_extension in ['.c', '.cpp']:
         compiler = 'g++' if file_extension == '.cpp' else 'gcc'
         exe_name = os.path.splitext(full_path)[0]
@@ -71,13 +77,16 @@ def execute_code_interactive(full_path, log_callback):
         if os.name != 'nt' and '/' not in exe_name: 
             cmd = ['./' + os.path.basename(exe_name)]
 
+    # --- JAVA (JVM) ---
     elif file_extension == '.java':
         log_callback(f"[Starting JVM for {file_name}...]\n")
         cmd = ['java', full_path]
+    
     else:
         log_callback(f"Unsupported file type: {file_extension}\n")
         return
 
+    # --- EXECUTION ---
     try:
         process = subprocess.Popen(
             cmd, 
@@ -88,6 +97,9 @@ def execute_code_interactive(full_path, log_callback):
             bufsize=0
         )
         
+        # Store the process in the shared dictionary for management (kill/input)
+        running_processes[sid] = process
+        
         # Start background thread to read output
         thread = threading.Thread(
             target=read_process_output, 
@@ -96,7 +108,7 @@ def execute_code_interactive(full_path, log_callback):
         thread.daemon = True
         thread.start()
         
-        return process # Return the process so app.py can manage it (kill/input)
+        return process
 
     except Exception as e:
         log_callback(f"Error starting process: {str(e)}\n")
