@@ -17,3 +17,15 @@ faiss-cpu
 google-generativeai 
 flask-socketio
 docker
+
+python-dotenv
+pymupdf
+python-docx
+python-pptx
+deep-translator
+faiss-cpu
+numpy
+
+speechrecognition
+eventlet
+gunicorn
