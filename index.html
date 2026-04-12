@@ -46,6 +46,7 @@
 
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
             <div class="space-y-6">
+                <!-- Command Input Card -->
                 <div class="glass-card p-6">
                     <div class="mb-4">
                         <label for="input-entry" class="block text-sm font-semibold text-slate-700 mb-2">Enter Command</label>
@@ -60,6 +61,7 @@
                     </div>
                 </div>
 
+                <!-- Terminal Card -->
                 <div class="glass-card flex flex-col h-full overflow-hidden">
                     <div class="px-6 py-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
                         <h3 class="font-semibold text-slate-800">Interactive Terminal</h3>
@@ -88,6 +90,7 @@
             </div>
 
             <div class="space-y-6">
+                <!-- File Explorer Card -->
                 <div class="glass-card overflow-hidden">
                     <div class="px-6 py-4 border-b border-slate-100 flex justify-between items-center bg-white">
                         <h3 class="font-semibold text-slate-800 flex items-center">File Explorer</h3>
@@ -101,6 +104,44 @@
                     </div>
                 </div>
 
+                <!-- System Efficiency Dashboard -->
+                <div class="glass-card p-6 bg-slate-900 border-indigo-500/30 shadow-xl">
+                    <h3 class="font-semibold text-indigo-300 mb-4 flex items-center">
+                        <span class="mr-2">📊</span> System Efficiency Dashboard
+                    </h3>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="p-3 bg-slate-800 rounded-lg border border-slate-700">
+                            <p class="text-[10px] text-slate-400 uppercase font-bold mb-1">Search Latency</p>
+                            <div class="flex items-baseline">
+                                <span id="metric-latency" class="text-xl font-mono text-emerald-400">0.00</span>
+                                <span class="text-[10px] text-slate-500 ml-1">ms</span>
+                            </div>
+                        </div>
+                        <div class="p-3 bg-slate-800 rounded-lg border border-slate-700">
+                            <p class="text-[10px] text-slate-400 uppercase font-bold mb-1">Routing Reliability</p>
+                            <div class="flex items-baseline">
+                                <span id="metric-routing" class="text-xl font-mono text-indigo-400">100</span>
+                                <span class="text-[10px] text-slate-500 ml-1">%</span>
+                            </div>
+                        </div>
+                        <div class="p-3 bg-slate-800 rounded-lg border border-slate-700">
+                            <p class="text-[10px] text-slate-400 uppercase font-bold mb-1">Processing Speed</p>
+                            <div class="flex items-baseline">
+                                <span id="metric-speed" class="text-xl font-mono text-sky-400">0.0</span>
+                                <span class="text-[10px] text-slate-500 ml-1">ch/s</span>
+                            </div>
+                        </div>
+                        <div class="p-3 bg-slate-800 rounded-lg border border-slate-700">
+                            <p class="text-[10px] text-slate-400 uppercase font-bold mb-1">Index Depth</p>
+                            <div class="flex items-baseline">
+                                <span id="metric-files" class="text-xl font-mono text-rose-400">0</span>
+                                <span class="text-[10px] text-slate-500 ml-1">docs</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Configuration Card -->
                 <div class="glass-card p-6">
                     <h3 class="font-semibold text-slate-800 mb-4 flex items-center">Configuration</h3>
                     <div class="space-y-4">
