@@ -18,11 +18,12 @@ from pptx import Presentation
 from deep_translator import GoogleTranslator
 
 # --- INTERNAL SERVICE IMPORTS ---
-from services import docker_service, youtube_service, rag_service
+from services import docker_service, youtube_service, rag_service, file_creator
+from services.metrics_service import tracker
+from services.api_manager import api_manager
 
 # --- INITIALIZATION & CONFIG ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 WORKSPACE_DIR = os.path.abspath("./workspace")
 
 if not os.path.exists(WORKSPACE_DIR):
@@ -63,19 +64,31 @@ tools_schema = [
         "function_declarations": [
             {
                 "name": "manage_file",
-                "description": "Opens, reads, or summarizes a local file in the workspace.",
+                "description": "Opens, reads, summarizes, or TRANSCRIBES a local file in the workspace.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "filename": {"type": "STRING"},
-                        "intent": {"type": "STRING", "enum": ["open", "read", "summarize", "execute"]}
+                        "intent": {"type": "STRING", "enum": ["open", "read", "summarize", "execute", "transcribe"]}
                     },
                     "required": ["filename", "intent"]
                 }
             },
             {
+                "name": "create_new_file",
+                "description": "Creates a new file (docx, py, java, txt) with AI-generated content in the workspace.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "filename": {"type": "STRING", "description": "Name including extension, e.g., 'sort.py' or 'essay.docx'"},
+                        "prompt": {"type": "STRING", "description": "Description of what content should be inside the file"}
+                    },
+                    "required": ["filename", "prompt"]
+                }
+            },
+            {
                 "name": "youtube_assistant",
-                "description": "Plays or transcribes YouTube videos for the user.",
+                "description": "Plays or transcribes YouTube videos (external links).",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -98,11 +111,13 @@ tools_schema = [
     }
 ]
 
-# AI Model initialization
-main_model = None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    main_model = genai.GenerativeModel('gemini-2.5-flash', tools=tools_schema)
+def get_rotated_model(use_tools=True):
+    """Initializes Gemini with a rotated API key from the pool."""
+    api_manager.rotate_key()
+    return genai.GenerativeModel(
+        'gemini-2.5-flash', 
+        tools=tools_schema if use_tools else None
+    )
 
 # --- SECURITY & UTILITY HELPERS ---
 
@@ -111,7 +126,7 @@ def get_safe_path(filename):
     safe_name = secure_filename(filename)
     full_path = os.path.abspath(os.path.join(WORKSPACE_DIR, safe_name))
     if not full_path.startswith(WORKSPACE_DIR):
-        raise PermissionError(f"Security Violation: Access denied to {filename}")
+        raise PermissionError("Security Violation")
     return full_path
 
 def extract_text(file_path, sid=None):
@@ -136,23 +151,28 @@ def extract_text(file_path, sid=None):
         # Build RAG Index in background if text is found
         if text and sid and sid in user_states:
             socketio.emit('terminal_output', {'text': f"[⚙️ Indexing {os.path.basename(file_path)}...]\n"}, room=sid)
-            user_states[sid].vector_store = rag_service.build_rag_index(text)
-            user_states[sid].current_file = os.path.basename(file_path)
+            v_store = rag_service.build_rag_index(text)
+            if v_store:
+                user_states[sid].vector_store = v_store
+                user_states[sid].current_file = os.path.basename(file_path)
+            else:
+                return "ERROR: RAG Indexing failed (Check Embedding API Quota)."
             
         return text
     except Exception as e:
-        return f"Extraction Error: {str(e)}"
+        return f"ERROR: Extraction failed: {str(e)}"
 
 # --- PRIMARY BUSINESS LOGIC ---
 
 def handle_file_intent(filename, intent, sid):
-    """Core logic for handling file-based user requests."""
+    """Core logic for handling local file requests (Interception layer)."""
     try:
         path = get_safe_path(filename)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-    # Intent: OPEN (System Level)
+    target_lang_name = LANGUAGES.get(user_states[sid].lang, "English")
+
     if intent == "open":
         try:
             sys_name = platform.system()
@@ -162,99 +182,112 @@ def handle_file_intent(filename, intent, sid):
         except Exception as e:
             return {"status": "error", "message": f"System Open Error: {e}"}
 
-    # Intent: READ (Parsing & Display)
     if intent == "read":
         content = extract_text(path, sid=sid)
-        if not content:
-            return {"status": "error", "message": "This file contains no extractable text."}
+        if not content or content.startswith("ERROR:"):
+            return {"status": "error", "message": content or "No text found."}
         user_states[sid].content = content
         user_states[sid].read_pos = 0
         return {"status": "success", "action": "start_read", "message": f"Now reading: {filename}"}
 
-    # Intent: SUMMARIZE (Multimodal AI)
     if intent == "summarize":
         try:
-            socketio.emit('terminal_output', {'text': f"[🧠 AI Analyzing {filename}...]\n"}, room=sid)
-            summary = rag_service.summarize_multimodal(path)
+            ext = os.path.splitext(filename)[1].lower()
+            socketio.emit('terminal_output', {'text': f"[🧠 AI Analyzing {filename} in {target_lang_name}...]\n"}, room=sid)
+            
+            if ext in ['.docx', '.pptx', '.pdf', '.txt', '.md']:
+                text_content = extract_text(path, sid=sid)
+                if text_content.startswith("ERROR:"): return {"status": "error", "message": text_content}
+                
+                model = get_rotated_model(use_tools=False)
+                response = api_manager.execute_with_retry(
+                    model.generate_content,
+                    f"Provide a detailed summary IN {target_lang_name} for the following text:\n\n{text_content}"
+                )
+                summary = response.text
+            else:
+                summary = rag_service.summarize_multimodal(path, target_lang=target_lang_name)
+                
             user_states[sid].content = summary
             user_states[sid].read_pos = 0
             return {"status": "success", "action": "start_read", "message": summary}
         except Exception as e:
             return {"status": "error", "message": f"AI Summarization Failed: {str(e)}"}
 
-    # Intent: EXECUTE (Code Runner)
     if intent == "execute":
         docker_service.execute_code_interactive(path, sid, socketio, running_processes)
         return {"status": "success", "message": f"Initiated execution of {filename}."}
+
+    if intent == "transcribe":
+        socketio.emit('terminal_output', {'text': f"[🎙️ Local Transcription: Extracting audio from {filename}...]\n"}, room=sid)
+        start_time = datetime.now()
+        res = youtube_service.transcribe_video_file(path, target_lang=user_states[sid].lang)
+        duration = (datetime.now() - start_time).total_seconds()
+        
+        if res['status'] == 'success':
+            tracker.record_transcription(len(res['text_content']), max(0.1, duration))
+            user_states[sid].content = res['text_content']
+            user_states[sid].read_pos = 0
+            return {"status": "success", "action": "start_read", "message": res['text_content']}
+        return res
+
+    return {"status": "error", "message": f"Intent '{intent}' not implemented."}
 
 # --- FLASK WEB ROUTES ---
 
 @app.route('/')
 def home():
-    """Renders the main dashboard with dynamic language support."""
     opts = "".join([f'<option value="{c}" {"selected" if c=="en" else ""}>{n}</option>' 
                    for c, n in LANGUAGES.items()])
     return render_template('index.html', language_options=opts, default_lang='en')
 
 @app.route('/command', methods=['POST'])
 def process_command():
-    """Main endpoint for all user text/voice commands."""
     try:
         data = request.json
         sid, query = data.get('sid'), data.get('question', '').strip()
-        
-        if sid not in user_states:
-            user_states[sid] = UserSession()
-
-        # Update session language from request if present
+        if sid not in user_states: user_states[sid] = UserSession()
         if 'lang' in data: user_states[sid].lang = data['lang']
+        target_lang_name = LANGUAGES.get(user_states[sid].lang, "English")
 
-        # Parse basic string commands first (CLI style)
-        parts = query.split(' ', 1)
-        action = parts[0].lower()
+        parts = query.lower().split(' ', 1)
+        action = parts[0]
 
-        if action in ['open', 'read', 'run', 'execute', 'describe', 'summarize'] and len(parts) > 1:
-            file_arg = parts[1].strip()
-            ext = os.path.splitext(file_arg)[1].lower()
-            
-            # Context-aware intent switching
-            if ext in ['.jpg', '.png', '.mp4'] and action in ['read', 'describe']:
-                intent = "summarize"
-            else:
-                intent = "execute" if action == "run" else action
-            return jsonify(handle_file_intent(file_arg, intent, sid))
+        # --- MANDATORY INTERCEPTOR ---
+        if action in ['open', 'read', 'run', 'execute', 'summarize', 'transcribe'] and len(parts) > 1:
+            tracker.record_routing(True)
+            return jsonify(handle_file_intent(parts[1].strip(), action if action != "run" else "execute", sid))
 
-        # Handle Transcription commands
-        if action == 'transcribe' and len(parts) > 1:
-            target = user_states[sid].lang
-            path = get_safe_path(parts[1].strip())
-            socketio.emit('terminal_output', {'text': f"[🎙️ Transcribing to {target}...]\n"}, room=sid)
-            res = youtube_service.transcribe_video_file(path, target_lang=target)
-            if res['status'] == 'success':
-                user_states[sid].content = res['text_content']
-                user_states[sid].read_pos = 0
-                return jsonify({"status": "success", "action": "start_read", "message": res['text_content']})
-            return jsonify(res)
-
-        # AI Orchestration (Gemini Function Calling)
-        if not main_model:
-            return jsonify({"status": "error", "message": "Gemini API Key is not configured."})
-
-        chat = main_model.start_chat(enable_automatic_function_calling=True)
-        response = chat.send_message(query)
+        # AI Orchestration with Retry logic
+        model = get_rotated_model()
+        try:
+            response = api_manager.execute_with_retry(
+                model.generate_content,
+                f"Communication Language: {target_lang_name}. Task/Query: {query}"
+            )
+        except Exception:
+            return jsonify({"status": "error", "message": "Service capacity reached. Retrying with fresh keys..."})
         
-        # Check for function call responses
-        if response.candidates[0].content.parts[0].function_call:
+        is_fc = bool(response.candidates[0].content.parts[0].function_call)
+        tracker.record_routing(is_fc)
+
+        if is_fc:
             fc = response.candidates[0].content.parts[0].function_call
             args = dict(fc.args)
-
+            
             if fc.name == "manage_file":
                 return jsonify(handle_file_intent(args['filename'], args.get('intent', 'open'), sid))
             
+            if fc.name == "create_new_file":
+                socketio.emit('terminal_output', {'text': f"[📄 Generating '{args['filename']}'...]\n"}, room=sid)
+                res = file_creator.create_workspace_file(args['filename'], args['prompt'], target_lang=target_lang_name)
+                return jsonify(res)
+
             if fc.name == "ask_document":
                 if not user_states[sid].vector_store:
-                    return jsonify({"status": "error", "message": "No document is indexed for QA."})
-                ans = rag_service.query_rag_document(args.get('question', query), user_states[sid].vector_store)
+                    return jsonify({"status": "error", "message": "No document indexed. Please 'read' a file first."})
+                rag_query = f"ANSWER IN {target_lang_name}: {args.get('question', query)}"
+                ans = rag_service.query_rag_document(rag_query, user_states[sid].vector_store)
                 return jsonify({"status": "success", "message": ans})
 
         return jsonify({"status": "info", "message": response.text})
@@ -264,7 +297,6 @@ def process_command():
 
 @app.route('/list_files')
 def get_files():
-    """Returns a list of all safe files within the workspace."""
     try:
         file_list = []
         for root, _, filenames in os.walk(WORKSPACE_DIR):
@@ -278,7 +310,6 @@ def get_files():
 
 @app.route('/read_chunk')
 def fetch_text_chunk():
-    """Streaming helper for the UI to read content block-by-block with translation."""
     try:
         sid = request.args.get('sid')
         user = user_states.get(sid)
@@ -288,7 +319,6 @@ def fetch_text_chunk():
         chunk = user.content[user.read_pos : user.read_pos + 600]
         user.read_pos += 600
 
-        # On-the-fly translation
         if user.lang != 'en':
             try:
                 chunk = GoogleTranslator(source='auto', target=user.lang).translate(chunk)
@@ -297,12 +327,17 @@ def fetch_text_chunk():
         return jsonify({"status": "reading", "chunk": chunk})
     except:
         return jsonify({"status": "done"})
+    
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
 
-# --- SOCKET EVENTS ---
+@app.route('/get_metrics')
+def get_system_metrics():
+    return jsonify(tracker.get_report())
 
 @socketio.on('terminal_input')
 def handle_terminal(data):
-    """Passes user terminal input to active docker/system processes."""
     sid = request.sid
     if sid in running_processes:
         proc = running_processes[sid]
@@ -312,18 +347,19 @@ def handle_terminal(data):
 
 @socketio.on('kill_process')
 def handle_kill():
-    """Safely terminates active background processes."""
     sid = request.sid
+    if sid in user_states:
+        user_states[sid].content = ""
+        user_states[sid].read_pos = 0
+        
     if sid in running_processes:
         running_processes[sid].terminate()
         del running_processes[sid]
-        emit('terminal_output', {'text': "\n[Process Terminated by User]\n"})
+        emit('terminal_output', {'text': "\n[Process Terminated & Speech Silenced]\n"})
 
 @socketio.on('connect')
 def handle_connect():
-    """Initializes a new session on connection."""
     user_states[request.sid] = UserSession()
 
 if __name__ == '__main__':
-    # allow_unsafe_werkzeug used for local development environments
     socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
