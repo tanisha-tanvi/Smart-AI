@@ -18,7 +18,7 @@ from pptx import Presentation
 from deep_translator import GoogleTranslator
 
 # --- INTERNAL SERVICE IMPORTS ---
-from services import docker_service, youtube_service, rag_service, file_creator
+from services import youtube_service, rag_service, file_creator
 from services.metrics_service import tracker
 from services.api_manager import api_manager
 
