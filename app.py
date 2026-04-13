@@ -158,7 +158,10 @@ def extract_text(file_path, user):
 def home():
     opts = "".join([f'<option value="{c}" {"selected" if c=="en" else ""}>{n}</option>' 
                    for c, n in LANGUAGES.items()])
-    return render_template('index.html', language_options=opts, default_lang='en')
+    return render_template('index.html', 
+                           language_options=opts, 
+                           default_lang='en', 
+                           file_storage_path=BASE_WORKSPACE)
 
 @app.route('/upload', methods=['POST'])
 def handle_upload():
@@ -177,11 +180,18 @@ def handle_upload():
     file.save(local_path)
 
     try:
+        # Save to user-specific folder in bucket
         with open(local_path, 'rb') as f:
             storage.supabase.storage.from_('workspace-bucket').upload(f"{sid}/{filename}", f)
+        
+        # Record in database for persistence
         storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
         return jsonify({"status": "success", "message": f"Uploaded {filename}!"})
     except Exception as e:
+        # If file already exists in bucket, we ignore the error and just record it in DB
+        if "already exists" in str(e).lower():
+             storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
+             return jsonify({"status": "success", "message": f"Synced {filename} from bucket."})
         return jsonify({"status": "error", "message": str(e)})
 
 @app.route('/download/<sid>/<filename>')
@@ -193,16 +203,21 @@ def download_file(sid, filename):
     
     if not os.path.exists(file_path) and storage and storage.supabase:
         try:
-            # Try bucket download (binary)
+            # Try bucket download from user folder
             res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{filename}")
             with open(file_path, 'wb') as f: f.write(res)
         except:
-            # Fallback to DB content (text)
-            content = storage.get_file_content(sid, filename)
-            if content:
-                with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
-            else:
-                return "File not found", 404
+            # Try bucket download from root (fallback for manual uploads)
+            try:
+                res = storage.supabase.storage.from_('workspace-bucket').download(filename)
+                with open(file_path, 'wb') as f: f.write(res)
+            except:
+                # Fallback to DB content (text)
+                content = storage.get_file_content(sid, filename)
+                if content:
+                    with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
+                else:
+                    return "File not found", 404
 
     return send_from_directory(user_dir, filename, as_attachment=True)
 
@@ -214,14 +229,35 @@ def get_files():
     files_set = set()
     user = get_user_state(sid)
     
+    # 1. Check local ephemeral disk
     if os.path.exists(user.workspace):
         for f in os.listdir(user.workspace):
             if os.path.isfile(os.path.join(user.workspace, f)) and f.lower().endswith(SUPPORTED_EXTENSIONS):
                 files_set.add(f)
                 
+    # 2. Check Supabase DB Table
     if storage:
         db_files = storage.get_files(sid)
         for f in db_files: files_set.add(f)
+        
+        # 3. Check Supabase Bucket Directly (Crucial for manual uploads)
+        if storage.supabase:
+            try:
+                # List user's private folder
+                res = storage.supabase.storage.from_('workspace-bucket').list(sid)
+                if res:
+                    for item in res:
+                        if 'name' in item and item['name'] != '.emptyKeep':
+                            files_set.add(item['name'])
+                
+                # OPTIONAL: List root folder for manual uploads (Remove if you want strict privacy)
+                root_res = storage.supabase.storage.from_('workspace-bucket').list()
+                if root_res:
+                    for item in root_res:
+                        if 'name' in item and not item.get('id') is None: # only files, not folders
+                             files_set.add(item['name'])
+            except Exception as e:
+                print(f"Bucket scan error: {e}")
             
     return jsonify({"status": "success", "files": sorted(list(files_set))})
 
@@ -244,8 +280,11 @@ def process_command():
         path = os.path.join(user.workspace, filename)
         
         if action == "open":
-            db_files = storage.get_files(sid) if storage else []
-            if os.path.exists(path) or filename in db_files:
+            # Check if file exists anywhere
+            files_res = get_files()
+            all_files = files_res.get_json().get('files', [])
+            
+            if os.path.exists(path) or filename in all_files:
                 return jsonify({
                     "status": "success", "action": "open_url", 
                     "url": f"/download/{sid}/{filename}", 
