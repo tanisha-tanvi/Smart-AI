@@ -324,7 +324,34 @@ async function updateMetrics() {
         document.getElementById('metric-files').textContent = data.files_processed || 0;
     } catch (e) {}
 }
+async function performUpload() {
+    const fileInput = document.getElementById('file-upload-input');
+    const file = fileInput.files[0];
+    if (!file) return;
 
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('sid', currentSocketId);
+
+    safeUiUpdate(`System: Uploading ${file.name}...`, false);
+
+    try {
+        const response = await fetch('/upload', {
+            method: 'POST',
+            body: formData
+        });
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+            safeUiUpdate(data.message, false);
+            listFiles(); // Refresh the explorer to show the new file
+        } else {
+            safeUiUpdate(`Upload Error: ${data.message}`, false);
+        }
+    } catch (e) {
+        safeUiUpdate("System Error: Could not connect to upload service.", false);
+    }
+}
 // --- 10. INITIALIZATION ---
 
 document.addEventListener('DOMContentLoaded', () => {
