@@ -288,7 +288,42 @@ def process_command():
             return jsonify({"status": "error", "message": f"AI Error: {str(e)}"})
     
     return jsonify({"status": "error", "message": "System not fully initialized."})
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handles physical file uploads from the user's device to Supabase Storage."""
+    if 'file' not in request.files:
+        return jsonify({"status": "error", "message": "No file part"}), 400
+    
+    file = request.files['file']
+    sid = request.form.get('sid')
+    
+    if file.filename == '' or not sid:
+        return jsonify({"status": "error", "message": "Missing file or session ID"}), 400
 
+    filename = secure_filename(file.filename)
+    # Temporary save locally
+    user_dir = os.path.join(BASE_WORKSPACE, sid)
+    if not os.path.exists(user_dir): os.makedirs(user_dir)
+    local_path = os.path.join(user_dir, filename)
+    file.save(local_path)
+
+    try:
+        # Upload to Supabase Storage Bucket
+        with open(local_path, 'rb') as f:
+            storage_path = f"{sid}/{filename}"
+            # This uses the supabase library we already installed
+            storage.supabase.storage.from_('workspace-bucket').upload(
+                path=storage_path,
+                file=f,
+                file_options={"content-type": file.content_type}
+            )
+        
+        # Also log it in our 'workspaces' table so it shows up in the explorer
+        storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
+        
+        return jsonify({"status": "success", "message": f"Uploaded {filename} to cloud storage!"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 @app.route('/read_chunk')
 def fetch_chunk():
     sid = request.args.get('sid')
