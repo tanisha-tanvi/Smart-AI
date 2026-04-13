@@ -243,7 +243,7 @@ def process_command():
 
     if not query: return jsonify({"status": "info", "message": "Ready."})
 
-    # FIX: Don't lowercase the whole query, as filenames are case-sensitive
+    # Preserve case for filename handling
     parts = query.split(' ', 1)
     action = parts[0].lower()
     
@@ -251,32 +251,60 @@ def process_command():
         # Get raw filename to preserve case
         raw_filename = parts[1].strip().split()[0]
         filename = secure_filename(raw_filename)
-        path = os.path.join(user.workspace, filename)
+        
+        # Case-insensitive search for real filename
+        all_files = get_workspace_files(sid)
+        matched_file = next((f for f in all_files if f.lower() == filename.lower()), filename)
+        
+        path = os.path.join(user.workspace, matched_file)
         
         if action == "open":
-            all_files = get_workspace_files(sid)
-            # CASE-INSENSITIVE SEARCH
-            matched_file = next((f for f in all_files if f.lower() == filename.lower()), None)
-            
-            if os.path.exists(path) or matched_file:
-                final_name = matched_file if matched_file else filename
+            if os.path.exists(path) or matched_file in all_files:
                 return jsonify({
                     "status": "success", "action": "open_url", 
-                    "url": f"/download/{sid}/{final_name}", 
-                    "message": f"Opening {final_name}..."
+                    "url": f"/download/{sid}/{matched_file}", 
+                    "message": f"Opening {matched_file}..."
                 })
             return jsonify({"status": "error", "message": f"File '{filename}' not found."})
 
         if action == "read":
             if not os.path.exists(path) and storage:
                 try:
-                    res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{filename}")
+                    res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{matched_file}")
                     with open(path, 'wb') as f: f.write(res)
-                except: pass
+                except:
+                    try:
+                        res = storage.supabase.storage.from_('workspace-bucket').download(matched_file)
+                        with open(path, 'wb') as f: f.write(res)
+                    except: pass
             content = extract_text(path, user)
             user.content = content
             user.read_pos = 0
-            return jsonify({"status": "success", "action": "start_read", "message": f"Reading {filename}"})
+            return jsonify({"status": "success", "action": "start_read", "message": f"Reading {matched_file}"})
+
+        if action == "execute" or action == "run":
+            docker_service.execute_code_interactive(path, sid, socketio, running_processes)
+            return jsonify({"status": "success", "message": f"Initiated execution of {matched_file}."})
+
+        if action == "transcribe":
+            # Ensure file is available locally for transcription
+            if not os.path.exists(path) and storage:
+                try:
+                    res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{matched_file}")
+                    with open(path, 'wb') as f: f.write(res)
+                except:
+                    try:
+                        res = storage.supabase.storage.from_('workspace-bucket').download(matched_file)
+                        with open(path, 'wb') as f: f.write(res)
+                    except: pass
+            
+            socketio.emit('terminal_output', {'text': f"[🎙️ Transcribing {matched_file}...]\n"}, room=sid)
+            res = youtube_service.transcribe_video_file(path, target_lang=user.lang)
+            if res['status'] == 'success':
+                user.content = res['text_content']
+                user.read_pos = 0
+                return jsonify({"status": "success", "action": "start_read", "message": res['text_content']})
+            return jsonify(res)
 
         if action == "create":
             res = file_creator.create_workspace_file(filename, parts[1], user.workspace, target_lang=target_lang_name)
@@ -300,10 +328,14 @@ def process_command():
                     if res['status'] == 'success':
                         upload_to_bucket(sid, args['filename'], os.path.join(user.workspace, args['filename']))
                     return jsonify(res)
+                if fc.name == "ask_document":
+                    if not user.vector_store: return jsonify({"status": "error", "message": "Please 'read' the document first."})
+                    ans = rag_service.query_rag_document(args.get('question', query), user.vector_store)
+                    return jsonify({"status": "success", "message": ans})
             return jsonify({"status": "info", "message": response.text})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)})
-    return jsonify({"status": "error", "message": "System Error."})
+    return jsonify({"status": "error", "message": "System Error: API Manager not available."})
 
 @app.route('/read_chunk')
 def fetch_chunk():
