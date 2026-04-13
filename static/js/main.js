@@ -1,5 +1,11 @@
+/**
+ * NexAssist - Main Interaction Logic
+ * Supports: Multi-user Sessions, Remote File Transfers, Interactive Terminal, 
+ * Voice Recognition (STT), and Speech Synthesis (TTS).
+ */
+
+// --- 1. DOM ELEMENT REFERENCES ---
 const inputEntry = document.getElementById('input-entry');
-const outputLabel = document.getElementById('output-label');
 const readProgress = document.getElementById('read-progress');
 const fileListContainer = document.getElementById('file-list-container');
 const langSelect = document.getElementById('lang-select');
@@ -13,179 +19,202 @@ const terminalInput = document.getElementById('terminal-input');
 const outputContainer = document.getElementById('output-container');
 const voiceBtn = document.getElementById('voice-button');
 
+// --- 2. SOCKET.IO & SESSION SETUP ---
 const socket = io();
 let currentSocketId = null;
 
-// --- 1. GLOBAL KILL SWITCH STATE ---
-// This flag prevents any pending or arriving responses from speaking.
-let stopRequested = false;
+socket.on('connect', () => { 
+    currentSocketId = socket.id; 
+    console.log("Connected to NexAssist. Session ID:", currentSocketId);
+    listFiles(); // Load workspace for this session immediately
+});
 
-function killProcess() {
-    // 1. Tell backend to terminate any active Docker/Subprocesses
-    socket.emit('kill_process');
-    
-    // 2. Set local flag to ignore incoming voice responses immediately
-    stopRequested = true;
-    
-    // 3. Immediately silence current speech and clear the browser's speech queue
-    isReading = false;
-    window.speechSynthesis.cancel();
-    
-    // 4. Update UI to reflect stop
-    if (readProgress) readProgress.textContent = "STOPPED";
-    updateControlButtons(false);
-    
-    console.log("🛑 Global stop triggered. Speech silenced and responses blocked.");
-}
-
-// --- 2. SYSTEM EFFICIENCY METRICS ---
-async function updateEfficiencyMetrics() {
-    try {
-        const response = await fetch('/get_metrics');
-        const data = await response.json();
-        
-        document.getElementById('metric-latency').textContent = data.search_latency_ms;
-        document.getElementById('metric-routing').textContent = data.routing_reliability;
-        document.getElementById('metric-speed').textContent = data.transcription_speed;
-        document.getElementById('metric-files').textContent = data.files_processed;
-        
-        const latencyEl = document.getElementById('metric-latency');
-        if (data.search_latency_ms > 500) latencyEl.className = 'text-xl font-mono text-rose-400';
-        else if (data.search_latency_ms > 200) latencyEl.className = 'text-xl font-mono text-amber-400';
-        else latencyEl.className = 'text-xl font-mono text-emerald-400';
-    } catch (e) { console.error("Metrics sync error", e); }
-}
-
-setInterval(updateEfficiencyMetrics, 3000);
-
-// --- 3. MICROPHONE / SPEECH RECOGNITION ---
-let recognition;
-let isListening = false;
-
-if ('webkitSpeechRecognition' in window) {
-    recognition = new webkitSpeechRecognition();
-    recognition.continuous = false;
-    recognition.lang = 'en-US';
-    recognition.interimResults = false;
-
-    recognition.onstart = function() {
-        isListening = true;
-        voiceBtn.classList.remove('bg-white', 'text-slate-700');
-        voiceBtn.classList.add('bg-rose-500', 'text-white', 'animate-pulse', 'border-rose-600');
-        voiceBtn.innerText = "Listening...";
-        inputEntry.placeholder = "Listening...";
-    };
-
-    recognition.onend = function() {
-        isListening = false;
-        voiceBtn.classList.remove('bg-rose-500', 'text-white', 'animate-pulse', 'border-rose-600');
-        voiceBtn.classList.add('bg-white', 'text-slate-700');
-        voiceBtn.innerText = "Voice";
-        inputEntry.placeholder = "What would you like to do?";
-    };
-
-    recognition.onresult = function(event) {
-        const transcript = event.results[0][0].transcript;
-        inputEntry.value = transcript;
-        safeUiUpdate(`You said: "${transcript}"`, false);
-        submitCommand(transcript);
-    };
-
-    recognition.onerror = function() { isListening = false; voiceBtn.innerText = "Error"; };
-}
-
-function startVoiceCommand() {
-    if (!recognition) return;
-    isListening ? recognition.stop() : recognition.start();
-}
-
-// --- 4. SOCKET IO LOGIC ---
-socket.on('connect', () => { currentSocketId = socket.id; });
-
+// Real-time terminal output from backend (Docker/Transcriptions)
 socket.on('terminal_output', (data) => {
     const span = document.createElement('div');
     span.className = "whitespace-pre-wrap font-mono text-xs text-green-400";
     span.innerText = data.text;
     
-    const terminalView = document.getElementById('output-container');
-    if(terminalView) {
-        const inputLine = terminalView.lastElementChild;
-        terminalView.insertBefore(span, inputLine);
-        terminalView.scrollTop = terminalView.scrollHeight;
+    if(outputContainer) {
+        const inputLine = outputContainer.querySelector('.flex.items-center');
+        outputContainer.insertBefore(span, inputLine);
+        outputContainer.scrollTop = outputContainer.scrollHeight;
     }
 });
 
-function handleTerminalEnter(event) {
-    if (event.key === 'Enter') {
-        const text = terminalInput.value;
-        const echo = document.createElement('div');
-        echo.className = "whitespace-pre-wrap font-mono text-xs text-slate-300";
-        echo.innerHTML = `<span class="text-green-400">$</span> ${text}`;
-        
-        const terminalView = document.getElementById('output-container');
-        const inputLine = terminalView.lastElementChild;
-        terminalView.insertBefore(echo, inputLine);
-        
-        socket.emit('terminal_input', { input: text });
-        terminalInput.value = '';
-        terminalView.scrollTop = terminalView.scrollHeight;
-    }
-}
-
-// --- 5. READING & PLAYBACK ---
+// --- 3. GLOBAL STATE ---
+let stopRequested = false;
 let isReading = false;
 let hasContent = false;
-let selectedVoice = null;
 let currentRate = 1.0;
 
-function setReadingRate(rate) {
-    currentRate = Math.min(2.0, Math.max(0.5, parseFloat(rate)));
-    rateSlider.value = currentRate;
-    currentRateLabel.textContent = `${currentRate.toFixed(1)}x`;
-}
+// --- 4. COMMAND SUBMISSION (THE CORE LOGIC) ---
 
-function safeUiUpdate(text, isFileContent = false) {
-    if (!isFileContent) {
-        const msg = document.createElement('div');
-        msg.className = "mb-2 pb-1 border-b border-slate-800";
-        msg.innerHTML = `<span class="text-indigo-400 font-bold">AI:</span> <span class="text-slate-200">${text}</span>`;
-        const terminalView = document.getElementById('output-container');
-        const inputLine = terminalView.lastElementChild;
-        terminalView.insertBefore(msg, inputLine);
-        terminalView.scrollTop = terminalView.scrollHeight;
-        readProgress.textContent = '';
-        updateControlButtons(false);
+async function submitCommand(overrideCommand = null) {
+    const commandText = (overrideCommand || inputEntry.value).trim();
+    if (!commandText) return;
+
+    stopRequested = false;
+    
+    // UI Update: Show user command in terminal
+    const msg = document.createElement('div');
+    msg.className = "mb-2 pb-1 border-b border-slate-800";
+    msg.innerHTML = `<span class="text-sky-400 font-bold">You:</span> <span class="text-slate-200">${commandText}</span>`;
+    if (outputContainer) {
+        outputContainer.insertBefore(msg, outputContainer.querySelector('.flex.items-center'));
+        outputContainer.scrollTop = outputContainer.scrollHeight;
+    }
+
+    // Reset input if manually typed
+    if (!overrideCommand) inputEntry.value = '';
+
+    // Guard: Handle basic stop/pause command locally
+    if (commandText.toLowerCase() === 'stop' || commandText.toLowerCase() === 'pause') {
+        stopReading();
+        return;
+    }
+
+    try {
+        const response = await fetch('/command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                question: commandText, 
+                sid: currentSocketId,
+                lang: langSelect.value
+            })
+        });
+
+        const data = await response.json();
+
+        if (stopRequested) return;
+
+        /**
+         * REMOTE DEVICE FIX:
+         * If the server sends an 'open_url', it means the user wants to view a file.
+         * Instead of opening it on the server (which fails in cloud), we trigger a 
+         * local download on the user's browser (Phone/Laptop).
+         */
+        if (data.action === 'open_url') {
+            const downloadLink = document.createElement('a');
+            downloadLink.href = data.url;
+            downloadLink.download = ""; 
+            document.body.appendChild(downloadLink);
+            downloadLink.click();
+            document.body.removeChild(downloadLink);
+            safeUiUpdate(`System: Initiating file transfer to your device...`, false);
+        }
+
+        if (data.action === 'start_read') {
+            hasContent = true;
+            isReading = true;
+            updateControlButtons(true);
+            fetchAndSpeakChunk(); 
+        } 
+
+        if (data.status === 'success' || data.status === 'info') {
+            safeUiUpdate(data.message, false);
+            listFiles(); // Refresh explorer in case a file was created
+        } else if (data.status === 'error') {
+            safeUiUpdate(`Error: ${data.message}`, false);
+        }
+
+        // Speak the text response for non-reading tasks
+        if (data.action !== 'start_read' && !stopRequested && data.status !== 'error') {
+            await speak(data.message);
+        }
+
+    } catch (error) {
+        console.error("Submission Error:", error);
+        safeUiUpdate("Error: Failed to communicate with the AI server.", false);
     }
 }
 
-function updateControlButtons(readingActive) {
-    pauseButton.disabled = !readingActive;
-    restartButton.disabled = !hasContent;
-    if (readingActive) {
-        pauseButton.textContent = "Pause";
-        resumeButton.disabled = true;
-        pauseButton.className = "flex-1 py-2 px-3 bg-indigo-100 border border-indigo-200 rounded text-sm font-bold text-indigo-700";
-    } else {
-        pauseButton.className = "flex-1 py-2 px-3 bg-white border border-slate-200 rounded text-sm font-medium text-slate-600";
-        resumeButton.disabled = !(hasContent && !isReading);
-        resumeButton.className = resumeButton.disabled ? "flex-1 py-2 px-3 bg-white border border-slate-200 rounded text-sm font-medium text-slate-600 opacity-50" : "flex-1 py-2 px-3 bg-emerald-100 border border-emerald-200 rounded text-sm font-bold text-emerald-700";
+// --- 5. FILE EXPLORER (SUPABASE INTEGRATED) ---
+
+async function listFiles() {
+    if (!currentSocketId) return;
+    fileListContainer.innerHTML = '<div class="text-center py-6 text-slate-400 text-xs italic">Syncing with cloud workspace...</div>';
+    
+    try {
+        const res = await fetch(`/list_files?sid=${currentSocketId}`);
+        const data = await res.json();
+        
+        if (data.files && data.files.length > 0) {
+            // Group files by extension for better UI
+            const grouped = data.files.reduce((acc, file) => {
+                const ext = file.split('.').pop().toUpperCase();
+                const group = ext + ' FILES';
+                if (!acc[group]) acc[group] = [];
+                acc[group].push(file);
+                return acc;
+            }, {});
+
+            let html = '';
+            for (const groupName in grouped) {
+                const files = grouped[groupName];
+                const ext = groupName.split(' ')[0].toLowerCase();
+                
+                const filesHtml = files.map(file => `
+                    <div class="flex items-center justify-between p-3 border-b border-slate-100 hover:bg-slate-50 transition">
+                        <span class="text-sm text-slate-700 truncate font-medium max-w-[150px]">${file}</span>
+                        <div class="flex gap-1">
+                            <button onclick="submitCommand('open ${file}')" class="text-[10px] bg-indigo-50 text-indigo-600 px-2 py-1 rounded font-bold border border-indigo-100">Open</button>
+                            <button onclick="submitCommand('read ${file}')" class="text-[10px] bg-slate-100 text-slate-600 px-2 py-1 rounded font-bold border border-slate-200">Read</button>
+                        </div>
+                    </div>
+                `).join('');
+
+                html += `
+                    <div class="mb-3 bg-white rounded-lg border border-slate-200 overflow-hidden shadow-sm">
+                        <div class="px-3 py-2 bg-slate-50 text-[10px] font-bold text-slate-500 uppercase border-b border-slate-200">${groupName}</div>
+                        <div>${filesHtml}</div>
+                    </div>
+                `;
+            }
+            fileListContainer.innerHTML = html;
+        } else {
+            fileListContainer.innerHTML = '<div class="text-center py-8 text-slate-400 text-xs italic">Workspace is empty.</div>';
+        }
+    } catch (e) {
+        fileListContainer.innerHTML = '<div class="text-red-400 text-xs p-4">Failed to fetch files from Supabase.</div>';
+    }
+}
+
+// --- 6. SPEECH & READING LOGIC (TTS) ---
+
+async function fetchAndSpeakChunk() {
+    if (!isReading || stopRequested) return;
+
+    try {
+        const res = await fetch(`/read_chunk?sid=${currentSocketId}`);
+        const data = await res.json();
+
+        if (data.status === 'reading' && !stopRequested) {
+            if (readProgress) readProgress.textContent = "🔊 READING...";
+            await speak(data.chunk);
+            if (isReading && !stopRequested) setTimeout(fetchAndSpeakChunk, 100);
+        } else {
+            stopReading();
+        }
+    } catch (e) {
+        stopReading();
     }
 }
 
 function speak(text) {
-    // GUARD: If stop was requested, do not start any new speech
     if (stopRequested) return Promise.resolve();
-
     window.speechSynthesis.cancel();
+    
     const utterance = new SpeechSynthesisUtterance(text);
-    const selectedLangCode = langSelect.value; 
-    utterance.lang = selectedLangCode;
-
-    const voices = window.speechSynthesis.getVoices();
-    const matchingVoice = voices.find(v => v.lang.startsWith(selectedLangCode));
-    if (matchingVoice) utterance.voice = matchingVoice;
-
+    utterance.lang = langSelect.value;
     utterance.rate = currentRate;
+    
+    // Find matching voice for the language
+    const voices = window.speechSynthesis.getVoices();
+    const voice = voices.find(v => v.lang.startsWith(langSelect.value)) || voices[0];
+    if (voice) utterance.voice = voice;
+
     return new Promise(resolve => {
         utterance.onend = resolve;
         utterance.onerror = resolve;
@@ -196,206 +225,114 @@ function speak(text) {
 function stopReading() {
     isReading = false;
     window.speechSynthesis.cancel();
-    if (hasContent && !stopRequested) readProgress.textContent = "PAUSED";
+    if (readProgress) readProgress.textContent = "PAUSED";
     updateControlButtons(false);
 }
 
-function loadVoices() {
-    const populateVoiceList = () => {
-        const voices = window.speechSynthesis.getVoices();
-        voiceSelect.innerHTML = '';
-        const targetLangCode = langSelect.value || 'en'; 
-        const filteredVoices = voices.filter(voice => voice.lang.startsWith(targetLangCode));
-        const voicesToDisplay = filteredVoices.length > 0 ? filteredVoices : voices;
-        
-        voicesToDisplay.forEach((voice, index) => {
-            const option = document.createElement('option');
-            option.textContent = `${voice.name} (${voice.lang})`;
-            option.value = voice.name;
-            if (index === 0) { option.selected = true; selectedVoice = voice; }
-            voiceSelect.appendChild(option);
-        });
-    };
-    if ('onvoiceschanged' in window.speechSynthesis) window.speechSynthesis.onvoiceschanged = populateVoiceList;
-    populateVoiceList();
-}
+// --- 7. VOICE RECOGNITION (STT) ---
 
-function setVoice(voiceName) {
-    const voices = window.speechSynthesis.getVoices();
-    const newVoice = voices.find(v => v.name === voiceName);
-    if (newVoice) selectedVoice = newVoice;
-}
-
-function setTranslationLanguage() {
-    const langName = langSelect.options[langSelect.selectedIndex].text;
-    submitCommand(`translate to ${langName}`);
-    setTimeout(loadVoices, 100); 
-}
-
-// --- 6. BACKEND COMMUNICATION ---
-async function submitCommand(overrideCommand = null) {
-    const command = (overrideCommand || inputEntry.value).trim().toLowerCase();
-    if (!command) return;
-    
-    // RESET STOP FLAG: Allow speech for the new manual command
-    stopRequested = false;
-    
-    if(!overrideCommand) {
-        const msg = document.createElement('div');
-        msg.className = "mb-2 pb-1 border-b border-slate-800";
-        msg.innerHTML = `<span class="text-sky-400 font-bold">You:</span> <span class="text-slate-200">${command}</span>`;
-        const terminalView = document.getElementById('output-container');
-        terminalView.insertBefore(msg, terminalView.lastElementChild);
-        terminalView.scrollTop = terminalView.scrollHeight;
-    }
-    
-    if (command === 'stop' || command === 'pause') { stopReading(); return; }
-    stopReading();
-
-    try {
-        const response = await fetch('/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ question: command, sid: currentSocketId }) 
-        });
-        
-        const data = await response.json();
-        
-        // GUARD: If stop was clicked while waiting for the network response, stay silent
-        if (stopRequested) return;
-
-        if (data.action === 'start_read') {
-            hasContent = true;
-            isReading = true;
-            updateControlButtons(true);
-            fetchAndSpeakChunk(); 
-        } 
-        else if (data.action === 'file_loaded') {
-            hasContent = true;
-            updateControlButtons(false);
-        }
-        else if (data.action === 'open_url') { window.open(data.url, '_blank'); }
-        
-        safeUiUpdate(data.message, false);
-        
-        // Only speak the result if a "Stop" hasn't been requested in the meantime
-        if (data.action !== 'start_read' && !stopRequested) { 
-            await speak(data.message); 
-        }
-        
-        if (data.hasOwnProperty('has_content')) hasContent = data.has_content;
-        updateControlButtons(data.action === 'start_read');
-        if (!overrideCommand) inputEntry.value = '';
-
-    } catch (error) {
-        // Guard against speaking error messages if the user hit stop
-        if (stopRequested) return;
-        
-        safeUiUpdate(`Error: ${error.message}`, false);
-        speak("I encountered an error communicating with the server.");
-    }
-}
-
-async function fetchAndSpeakChunk() {
-    // GUARD: Break recursion if stop is requested or reading is toggled off
-    if (!isReading || stopRequested) {
-        isReading = false;
+function startVoiceCommand() {
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+        safeUiUpdate("System: Voice recognition not supported on this browser.", false);
         return;
     }
+
+    const rec = new Recognition();
+    rec.lang = langSelect.value + '-US'; // Basic fallback logic
     
-    try {
-        const response = await fetch(`/read_chunk?sid=${currentSocketId}`);
-        const data = await response.json();
+    rec.onstart = () => {
+        voiceBtn.textContent = "Listening...";
+        voiceBtn.classList.add('bg-red-50', 'text-red-600', 'animate-pulse');
+    };
 
-        if (data.status === 'reading' && !stopRequested) {
-            const terminalView = document.getElementById('output-container');
-            if (terminalView) {
-                const textDiv = document.createElement('div');
-                textDiv.className = "mb-2 p-2 bg-slate-800/50 border-l-2 border-indigo-400 rounded-r text-slate-200 text-sm";
-                textDiv.innerHTML = `<span class="text-indigo-400 font-bold text-xs uppercase mr-2">[Reading]</span>${data.chunk}`;
-                terminalView.insertBefore(textDiv, terminalView.lastElementChild);
-                terminalView.scrollTop = terminalView.scrollHeight;
-            }
+    rec.onresult = (e) => {
+        const text = e.results[0][0].transcript;
+        inputEntry.value = text;
+        submitCommand();
+    };
 
-            if (readProgress) readProgress.textContent = "🔊 READING...";
-            
-            // Speak chunk and wait for it to finish
-            await speak(data.chunk);
-            
-            // Re-check stop flag before scheduling next chunk
-            if (isReading && !stopRequested) { 
-                setTimeout(fetchAndSpeakChunk, 100); 
-            }
-        } else {
-            stopReading();
-        }
-    } catch (error) { 
-        stopReading(); 
+    rec.onend = () => {
+        voiceBtn.textContent = "Voice";
+        voiceBtn.classList.remove('bg-red-50', 'text-red-600', 'animate-pulse');
+    };
+
+    rec.start();
+}
+
+// --- 8. UI HELPERS & TERMINAL ---
+
+function safeUiUpdate(text, isFileContent = false) {
+    const msg = document.createElement('div');
+    msg.className = "mb-2 pb-1 border-b border-slate-800";
+    msg.innerHTML = `<span class="text-indigo-400 font-bold">AI:</span> <span class="text-slate-200">${text}</span>`;
+    
+    if (outputContainer) {
+        const inputLine = outputContainer.querySelector('.flex.items-center');
+        outputContainer.insertBefore(msg, inputLine);
+        outputContainer.scrollTop = outputContainer.scrollHeight;
     }
 }
 
-// --- 7. UI HELPERS & INITIALIZATION ---
-function toggleFolder(folderId, button) {
-    const folder = document.getElementById(folderId);
-    const icon = button.querySelector('.toggle-icon');
-    folder.classList.toggle('hidden');
-    icon.textContent = folder.classList.contains('hidden') ? '▼' : '▲';
-}
-
-async function listFiles() {
-    fileListContainer.innerHTML = '<p class="text-center py-4 text-slate-400 text-sm">Scanning files...</p>';
-    try {
-        const response = await fetch('/list_files');
-        const data = await response.json();
-        if (data.status === 'success' && data.files.length > 0) {
-            const grouped = data.files.reduce((acc, file) => {
-                const ext = file.split('.').pop().toLowerCase();
-                const group = ext.toUpperCase() + ' FILES';
-                if (!acc[group]) acc[group] = [];
-                acc[group].push(file);
-                return acc;
-            }, {});
+function handleTerminalEnter(event) {
+    if (event.key === 'Enter') {
+        const val = terminalInput.value;
+        if (val.trim()) {
+            // Echo input in terminal
+            const echo = document.createElement('div');
+            echo.className = "font-mono text-xs text-slate-400";
+            echo.innerHTML = `<span class="text-green-400">$</span> ${val}`;
+            outputContainer.insertBefore(echo, outputContainer.querySelector('.flex.items-center'));
             
-            let html = '';
-            for (const groupName in grouped) {
-                const files = grouped[groupName];
-                const ext = groupName.split(' ')[0].toLowerCase();
-                const isVideo = ext.match(/mp4|mov|avi/i);
-                const isCode = ext.match(/py|java|c|cpp|js/i);
-                const isImage = ext.match(/jpg|jpeg|png/i);
-                let icon = isVideo ? '🎥' : (isCode ? '🧑‍💻' : (isImage ? '🖼️' : '📄'));
-
-                const filesHtml = files.map(file => `
-                    <div class="flex flex-col items-start p-3 border-b border-slate-100 hover:bg-white transition group">
-                        <div class="flex items-center w-full mb-2 cursor-pointer" onclick="inputEntry.value='open ${file}'; submitCommand();">
-                            <span class="mr-2 text-lg">${icon}</span>
-                            <span class="text-slate-700 font-medium text-sm w-full truncate">${file}</span>
-                        </div>
-                        <div class="flex items-center space-x-2 w-full pl-7">
-                            <button onclick="inputEntry.value='open ${file}'; submitCommand();" class="text-xs font-medium px-2 py-1 bg-blue-50 text-blue-600 rounded border border-blue-200">Open</button>
-                            <button onclick="inputEntry.value='read ${file}'; submitCommand();" class="text-xs font-medium px-2 py-1 bg-emerald-50 text-emerald-600 rounded border border-emerald-200">Read</button>
-                            <button onclick="inputEntry.value='summarize ${file}'; submitCommand();" class="text-xs font-medium px-2 py-1 bg-sky-50 text-sky-600 rounded border border-sky-200">Summarize</button>
-                        </div>
-                    </div>`).join('');
-                
-                html += `
-                    <div class="mb-4 bg-white rounded-lg border border-slate-200 overflow-hidden">
-                        <button class="w-full text-left px-4 py-3 bg-slate-50 flex justify-between items-center" onClick="toggleFolder('folder-${ext}', this)">
-                            <span class="text-sm font-bold text-slate-600 uppercase">${groupName} (${files.length})</span>
-                            <span class="toggle-icon text-slate-400 text-xs">▼</span>
-                        </button>
-                        <div id="folder-${ext}" class="hidden border-t border-slate-200">${filesHtml}</div>
-                    </div>`;
-            }
-            fileListContainer.innerHTML = html;
+            // Send to backend via Socket
+            socket.emit('terminal_input', { input: val });
+            terminalInput.value = '';
         }
-    } catch (e) { fileListContainer.innerHTML = `<p class="text-red-500 text-sm p-4">Sync failed.</p>`; }
+    }
 }
+
+function killProcess() {
+    stopRequested = true;
+    window.speechSynthesis.cancel();
+    socket.emit('kill_process');
+    safeUiUpdate("System: Global kill signal sent.", false);
+}
+
+function updateControlButtons(active) {
+    if (pauseButton) pauseButton.disabled = !active;
+    if (resumeButton) resumeButton.disabled = !(!active && hasContent);
+}
+
+function setReadingRate(val) {
+    currentRate = parseFloat(val);
+    currentRateLabel.textContent = currentRate.toFixed(1) + 'x';
+}
+
+function loadVoices() {
+    window.speechSynthesis.getVoices(); // Trigger load
+}
+
+// --- 9. METRICS DASHBOARD ---
+
+async function updateMetrics() {
+    try {
+        const res = await fetch('/get_metrics');
+        const data = await res.json();
+        document.getElementById('metric-latency').textContent = data.search_latency_ms || 0;
+        document.getElementById('metric-routing').textContent = data.routing_reliability || 100;
+        document.getElementById('metric-speed').textContent = data.transcription_speed || 0;
+        document.getElementById('metric-files').textContent = data.files_processed || 0;
+    } catch (e) {}
+}
+
+// --- 10. INITIALIZATION ---
 
 document.addEventListener('DOMContentLoaded', () => {
-    langSelect.value = 'en';
-    listFiles(); 
-    loadVoices(); 
-    setReadingRate(1.0);
-    updateEfficiencyMetrics();
+    setInterval(updateMetrics, 3000);
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    
+    // Allow Enter key in main input
+    inputEntry.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') submitCommand();
+    });
 });
