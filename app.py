@@ -24,19 +24,25 @@ from docx import Document
 from pptx import Presentation
 from deep_translator import GoogleTranslator
 
-# --- INTERNAL SERVICE IMPORTS ---
+# --- SAFE INTERNAL SERVICE IMPORTS ---
+# We import each one separately so one failure doesn't kill the others
 try:
-    # We import the modules using the relative package structure for stability
     from services.storage_service import storage
-    from services.metrics_service import tracker
-    from services.api_manager import api_manager
-    from services import youtube_service, rag_service, file_creator, docker_service
-except ImportError as e:
-    print(f"❌ Critical Import Error: {e}")
-    # Fallbacks for robustness
-    tracker = None
-    api_manager = None
+except Exception as e:
+    print(f"❌ Storage Service failed to load: {e}")
     storage = None
+
+try:
+    from services.metrics_service import tracker
+except:
+    tracker = None
+
+try:
+    from services import youtube_service, rag_service, file_creator, docker_service
+    from services.api_manager import api_manager
+except Exception as e:
+    print(f"❌ Other services failed to load: {e}")
+    api_manager = None
 
 # --- INITIALIZATION & CONFIG ---
 load_dotenv()
@@ -58,23 +64,6 @@ try:
     LANGUAGES = {code: name.title() for name, code in _supported.items()}
 except Exception:
     LANGUAGES = {'en': 'English', 'hi': 'Hindi', 'es': 'Spanish', 'fr': 'French'}
-
-try:
-    from services.storage_service import storage
-except Exception as e:
-    print(f"❌ Storage Service failed to load: {e}")
-    storage = None
-
-try:
-    from services.metrics_service import tracker
-except:
-    tracker = None
-
-try:
-    from services import youtube_service, rag_service, file_creator, docker_service
-    from services.api_manager import api_manager
-except Exception as e:
-    print(f"❌ Other services failed to load: {e}")
 
 app = Flask(__name__)
 # Render requires eventlet and cors_allowed_origins="*" for stable web sockets
@@ -106,7 +95,7 @@ tools_schema = [
         "function_declarations": [
             {
                 "name": "manage_file",
-                "description": "Downloads (opens), reads, or summarizes a local file in the workspace.",
+                "description": "Downloads (opens), reads, or summarizes a local file.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -118,7 +107,7 @@ tools_schema = [
             },
             {
                 "name": "create_new_file",
-                "description": "Creates a new code or text file with AI-generated content.",
+                "description": "Creates a new file with AI-generated content.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -171,42 +160,65 @@ def home():
                    for c, n in LANGUAGES.items()])
     return render_template('index.html', language_options=opts, default_lang='en')
 
+@app.route('/upload', methods=['POST'])
+def handle_upload():
+    """Handles binary file uploads to Supabase Storage Buckets."""
+    if not storage or not storage.supabase:
+        return jsonify({"status": "error", "message": "Database not connected."}), 500
+        
+    file = request.files.get('file')
+    sid = request.form.get('sid')
+    if not file or not sid: return jsonify({"status": "error", "message": "Missing data"}), 400
+    
+    filename = secure_filename(file.filename)
+    user_dir = os.path.join(BASE_WORKSPACE, sid)
+    if not os.path.exists(user_dir): os.makedirs(user_dir)
+    local_path = os.path.join(user_dir, filename)
+    file.save(local_path)
+
+    try:
+        with open(local_path, 'rb') as f:
+            storage.supabase.storage.from_('workspace-bucket').upload(f"{sid}/{filename}", f)
+        storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
+        return jsonify({"status": "success", "message": f"Uploaded {filename}!"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
 @app.route('/download/<sid>/<filename>')
 def download_file(sid, filename):
-    """
-    Serves files from local workspace. If missing from disk (Render restart),
-    it pulls the content from Supabase before serving.
-    """
+    """Serves files from local workspace or recovers them from Supabase."""
     user_dir = os.path.join(BASE_WORKSPACE, sid)
     if not os.path.exists(user_dir): os.makedirs(user_dir)
     file_path = os.path.join(user_dir, filename)
     
-    # Recovery from Supabase if local disk is wiped
-    if not os.path.exists(file_path) and storage:
-        content = storage.get_file_content(sid, filename)
-        if content:
-            with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
-        else:
-            return "File not found", 404
+    if not os.path.exists(file_path) and storage and storage.supabase:
+        try:
+            # Try bucket download (binary)
+            res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{filename}")
+            with open(file_path, 'wb') as f: f.write(res)
+        except:
+            # Fallback to DB content (text)
+            content = storage.get_file_content(sid, filename)
+            if content:
+                with open(file_path, 'w', encoding='utf-8') as f: f.write(content)
+            else:
+                return "File not found", 404
 
     return send_from_directory(user_dir, filename, as_attachment=True)
 
 @app.route('/list_files')
 def get_files():
-    """Returns a merged list of local ephemeral files and persistent cloud files."""
     sid = request.args.get('sid')
     if not sid: return jsonify({"status": "error", "files": []})
     
     files_set = set()
     user = get_user_state(sid)
     
-    # 1. Check local disk
     if os.path.exists(user.workspace):
         for f in os.listdir(user.workspace):
             if os.path.isfile(os.path.join(user.workspace, f)) and f.lower().endswith(SUPPORTED_EXTENSIONS):
                 files_set.add(f)
                 
-    # 2. Check Supabase
     if storage:
         db_files = storage.get_files(sid)
         for f in db_files: files_set.add(f)
@@ -227,7 +239,6 @@ def process_command():
     parts = query.lower().split(' ', 1)
     action = parts[0]
     
-    # --- COMMAND INTERCEPTOR ---
     if action in ['open', 'read', 'run', 'execute', 'summarize', 'transcribe', 'create'] and len(parts) > 1:
         filename = secure_filename(parts[1].strip().split()[0])
         path = os.path.join(user.workspace, filename)
@@ -236,37 +247,17 @@ def process_command():
             db_files = storage.get_files(sid) if storage else []
             if os.path.exists(path) or filename in db_files:
                 return jsonify({
-                    "status": "success", 
-                    "action": "open_url", 
+                    "status": "success", "action": "open_url", 
                     "url": f"/download/{sid}/{filename}", 
-                    "message": f"Sending {filename} to your device..."
+                    "message": f"Opening {filename}..."
                 })
-            return jsonify({"status": "error", "message": f"File '{filename}' not found."})
+            return jsonify({"status": "error", "message": "File not found."})
 
         if action == "read":
-            # Pull from Cloud if missing locally
-            if not os.path.exists(path) and storage:
-                content = storage.get_file_content(sid, filename)
-                if content:
-                    with open(path, 'w', encoding='utf-8') as f: f.write(content)
-            
             content = extract_text(path, user)
             user.content = content
             user.read_pos = 0
-            return jsonify({"status": "success", "action": "start_read", "message": f"Reading {filename}..."})
-
-        if action == "execute" or action == "run":
-            docker_service.execute_code_interactive(path, sid, socketio, running_processes)
-            return jsonify({"status": "success", "message": "Initiated execution check."})
-
-        if action == "transcribe":
-            socketio.emit('terminal_output', {'text': f"[🎙️ Transcribing {filename}...]\n"}, room=sid)
-            res = youtube_service.transcribe_video_file(path, target_lang=user.lang)
-            if res['status'] == 'success':
-                user.content = res['text_content']
-                user.read_pos = 0
-                return jsonify({"status": "success", "action": "start_read", "message": res['text_content']})
-            return jsonify(res)
+            return jsonify({"status": "success", "action": "start_read", "message": f"Reading {filename}"})
 
         if action == "create":
             res = file_creator.create_workspace_file(filename, parts[1], user.workspace, target_lang=target_lang_name)
@@ -275,20 +266,18 @@ def process_command():
                     storage.save_file(sid, filename, f.read())
             return jsonify(res)
 
-    # --- AI ORCHESTRATION ---
     if api_manager:
         api_manager.rotate_key()
         model = genai.GenerativeModel('gemini-1.5-flash', tools=tools_schema)
         try:
             response = api_manager.execute_with_retry(model.generate_content, f"Query: {query}")
             is_fc = bool(response.candidates[0].content.parts[0].function_call)
-            if tracker: tracker.record_routing(is_fc)
-
+            
             if is_fc:
                 fc = response.candidates[0].content.parts[0].function_call
                 args = dict(fc.args)
                 if fc.name == "manage_file":
-                    return jsonify({"status": "success", "action": "open_url", "url": f"/download/{sid}/{args['filename']}", "message": "Opening..."})
+                    return jsonify({"status": "success", "action": "open_url", "url": f"/download/{sid}/{args['filename']}", "message": "Processing..."})
                 if fc.name == "create_new_file":
                     res = file_creator.create_workspace_file(args['filename'], args['prompt'], user.workspace, target_lang=target_lang_name)
                     if res['status'] == 'success' and storage:
@@ -296,70 +285,36 @@ def process_command():
                             storage.save_file(sid, args['filename'], f.read())
                     return jsonify(res)
                 if fc.name == "ask_document":
-                    if not user.vector_store: return jsonify({"status": "error", "message": "Please 'read' a file first."})
+                    if not user.vector_store: return jsonify({"status": "error", "message": "Index doc first."})
                     ans = rag_service.query_rag_document(args.get('question', query), user.vector_store)
                     return jsonify({"status": "success", "message": ans})
 
             return jsonify({"status": "info", "message": response.text})
         except Exception as e:
-            return jsonify({"status": "error", "message": f"AI Error: {str(e)}"})
+            return jsonify({"status": "error", "message": str(e)})
     
-    return jsonify({"status": "error", "message": "System not fully initialized."})
-# --- SAFE INTERNAL SERVICE IMPORTS ---
-# We import each one separately so one failure doesn't kill the others
+    return jsonify({"status": "error", "message": "System Error."})
 
-@app.route('/upload', methods=['POST'])
-def handle_upload():
-    # ... your existing logic ...
-    try:
-        # Check if the storage object exists AND it actually connected to Supabase
-        if storage and storage.supabase:
-            with open(local_path, 'rb') as f:
-                storage.supabase.storage.from_('workspace-bucket').upload(f"{sid}/{filename}", f)
-            storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
-            return jsonify({"status": "success", "message": f"Uploaded {filename}!"})
-        else:
-            return jsonify({"status": "error", "message": "Database not connected. Check Render Environment Variables."})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)})
-
-### Why this happened:
-In your Render logs, look for a line starting with `❌ Critical Import Error`. It probably shows that a different file (like `docker_service`) had an error. Because they were all imported in one `try` block, the app gave up on `storage` as well. 
-
-Updating your **Canvas** file as shown above ensures `storage` is initialized as a valid object, which prevents the `'NoneType'` crash.
 @app.route('/read_chunk')
 def fetch_chunk():
     sid = request.args.get('sid')
     user = get_user_state(sid)
     if not user or not user.content or user.read_pos >= len(user.content):
         return jsonify({"status": "done"})
-    
     chunk = user.content[user.read_pos : user.read_pos + 600]
     user.read_pos += 600
     return jsonify({"status": "reading", "chunk": chunk})
 
 @app.route('/get_metrics')
 def get_metrics():
-    if tracker: return jsonify(tracker.get_report())
-    return jsonify({})
-
-# --- SOCKET EVENTS ---
+    return jsonify(tracker.get_report() if tracker else {})
 
 @socketio.on('kill_process')
 def handle_kill():
-    user = get_user_state(request.sid)
-    user.content = ""
     if request.sid in running_processes:
         running_processes[request.sid].terminate()
         del running_processes[request.sid]
-        emit('terminal_output', {'text': "\n[Process Force Stopped]\n"})
-
-@socketio.on('terminal_input')
-def handle_terminal(data):
-    if request.sid in running_processes:
-        proc = running_processes[request.sid]
-        proc.stdin.write((data.get('input', '') + "\n").encode())
-        proc.stdin.flush()
+        emit('terminal_output', {'text': "\n[Stopped]\n"})
 
 @socketio.on('connect')
 def handle_connect():
@@ -367,5 +322,4 @@ def handle_connect():
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    # Note: On Render, use 'gunicorn --worker-class eventlet -w 1 app:app --bind 0.0.0.0:$PORT'
     socketio.run(app, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)
