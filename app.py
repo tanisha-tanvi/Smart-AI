@@ -59,6 +59,23 @@ try:
 except Exception:
     LANGUAGES = {'en': 'English', 'hi': 'Hindi', 'es': 'Spanish', 'fr': 'French'}
 
+try:
+    from services.storage_service import storage
+except Exception as e:
+    print(f"❌ Storage Service failed to load: {e}")
+    storage = None
+
+try:
+    from services.metrics_service import tracker
+except:
+    tracker = None
+
+try:
+    from services import youtube_service, rag_service, file_creator, docker_service
+    from services.api_manager import api_manager
+except Exception as e:
+    print(f"❌ Other services failed to load: {e}")
+
 app = Flask(__name__)
 # Render requires eventlet and cors_allowed_origins="*" for stable web sockets
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
@@ -288,42 +305,28 @@ def process_command():
             return jsonify({"status": "error", "message": f"AI Error: {str(e)}"})
     
     return jsonify({"status": "error", "message": "System not fully initialized."})
+# --- SAFE INTERNAL SERVICE IMPORTS ---
+# We import each one separately so one failure doesn't kill the others
+
 @app.route('/upload', methods=['POST'])
-def upload_file():
-    """Handles physical file uploads from the user's device to Supabase Storage."""
-    if 'file' not in request.files:
-        return jsonify({"status": "error", "message": "No file part"}), 400
-    
-    file = request.files['file']
-    sid = request.form.get('sid')
-    
-    if file.filename == '' or not sid:
-        return jsonify({"status": "error", "message": "Missing file or session ID"}), 400
-
-    filename = secure_filename(file.filename)
-    # Temporary save locally
-    user_dir = os.path.join(BASE_WORKSPACE, sid)
-    if not os.path.exists(user_dir): os.makedirs(user_dir)
-    local_path = os.path.join(user_dir, filename)
-    file.save(local_path)
-
+def handle_upload():
+    # ... your existing logic ...
     try:
-        # Upload to Supabase Storage Bucket
-        with open(local_path, 'rb') as f:
-            storage_path = f"{sid}/{filename}"
-            # This uses the supabase library we already installed
-            storage.supabase.storage.from_('workspace-bucket').upload(
-                path=storage_path,
-                file=f,
-                file_options={"content-type": file.content_type}
-            )
-        
-        # Also log it in our 'workspaces' table so it shows up in the explorer
-        storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
-        
-        return jsonify({"status": "success", "message": f"Uploaded {filename} to cloud storage!"})
+        # Check if the storage object exists AND it actually connected to Supabase
+        if storage and storage.supabase:
+            with open(local_path, 'rb') as f:
+                storage.supabase.storage.from_('workspace-bucket').upload(f"{sid}/{filename}", f)
+            storage.save_file(sid, filename, f"[Binary File: {file.content_type}]")
+            return jsonify({"status": "success", "message": f"Uploaded {filename}!"})
+        else:
+            return jsonify({"status": "error", "message": "Database not connected. Check Render Environment Variables."})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)})
+
+### Why this happened:
+In your Render logs, look for a line starting with `❌ Critical Import Error`. It probably shows that a different file (like `docker_service`) had an error. Because they were all imported in one `try` block, the app gave up on `storage` as well. 
+
+Updating your **Canvas** file as shown above ensures `storage` is initialized as a valid object, which prevents the `'NoneType'` crash.
 @app.route('/read_chunk')
 def fetch_chunk():
     sid = request.args.get('sid')
