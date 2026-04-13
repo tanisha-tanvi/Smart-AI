@@ -2,7 +2,6 @@ import os
 import sys
 
 # --- PATH FIX FOR CLOUD DEPLOYMENT ---
-# Ensures the 'services' folder is found when running via Gunicorn on Render
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
@@ -127,48 +126,42 @@ tools_schema = [
 # --- INTERNAL HELPERS ---
 
 def get_workspace_files(sid):
-    """Internal helper to list files from local disk and Supabase Bucket exclusively."""
+    """Exclusively scans bucket and local disk. No table needed."""
     files_set = set()
     user = get_user_state(sid)
     
-    # 1. Local ephemeral disk
     if os.path.exists(user.workspace):
         for f in os.listdir(user.workspace):
             if os.path.isfile(os.path.join(user.workspace, f)) and f.lower().endswith(SUPPORTED_EXTENSIONS):
                 files_set.add(f)
                 
-    # 2. Supabase Bucket Direct Scan (Bypasses Table)
     if storage and storage.supabase:
         try:
-            # Check user-specific folder
+            # Check sid folder
             res = storage.supabase.storage.from_('workspace-bucket').list(sid)
             if res:
                 for item in res:
                     if 'name' in item and item['name'] != '.emptyKeep':
                         files_set.add(item['name'])
             
-            # Check bucket root (fallback for manual uploads)
+            # Check root folder (manual uploads)
             root_res = storage.supabase.storage.from_('workspace-bucket').list()
             if root_res:
                 for item in root_res:
                     if 'name' in item and item.get('id'): 
                          files_set.add(item['name'])
-        except Exception as e:
-            print(f"⚠️ Bucket listing failed: {e}")
+        except: pass
             
     return sorted(list(files_set))
 
 def upload_to_bucket(sid, filename, local_path):
-    """Utility to upload a local file to the bucket user folder."""
     if storage and storage.supabase:
         try:
             with open(local_path, 'rb') as f:
                 storage.supabase.storage.from_('workspace-bucket').upload(f"{sid}/{filename}", f)
             return True
         except Exception as e:
-            # If already exists, we consider it a success for sync purposes
             if "already exists" in str(e).lower(): return True
-            print(f"❌ Bucket upload failed: {e}")
     return False
 
 def extract_text(file_path, user):
@@ -196,16 +189,10 @@ def extract_text(file_path, user):
 def home():
     opts = "".join([f'<option value="{c}" {"selected" if c=="en" else ""}>{n}</option>' 
                    for c, n in LANGUAGES.items()])
-    return render_template('index.html', 
-                           language_options=opts, 
-                           default_lang='en', 
-                           file_storage_path=BASE_WORKSPACE)
+    return render_template('index.html', language_options=opts, default_lang='en', file_storage_path=BASE_WORKSPACE)
 
 @app.route('/upload', methods=['POST'])
 def handle_upload():
-    if not storage or not storage.supabase:
-        return jsonify({"status": "error", "message": "Supabase connection not initialized."}), 500
-        
     file = request.files.get('file')
     sid = request.form.get('sid')
     if not file or not sid: return jsonify({"status": "error", "message": "Missing data"}), 400
@@ -217,8 +204,8 @@ def handle_upload():
     file.save(local_path)
 
     if upload_to_bucket(sid, filename, local_path):
-        return jsonify({"status": "success", "message": f"Uploaded {filename} to cloud storage!"})
-    return jsonify({"status": "error", "message": "Failed to sync file to bucket."})
+        return jsonify({"status": "success", "message": f"Uploaded {filename}!"})
+    return jsonify({"status": "error", "message": "Bucket sync failed."})
 
 @app.route('/download/<sid>/<filename>')
 def download_file(sid, filename):
@@ -226,19 +213,16 @@ def download_file(sid, filename):
     if not os.path.exists(user_dir): os.makedirs(user_dir)
     file_path = os.path.join(user_dir, filename)
     
-    # Force recovery from Bucket if local disk is empty
     if not os.path.exists(file_path) and storage and storage.supabase:
         try:
-            # Try private folder
             res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{filename}")
             with open(file_path, 'wb') as f: f.write(res)
         except:
-            # Try root folder
             try:
                 res = storage.supabase.storage.from_('workspace-bucket').download(filename)
                 with open(file_path, 'wb') as f: f.write(res)
             except:
-                return "File not found in cloud bucket", 404
+                return "Not found in bucket", 404
 
     return send_from_directory(user_dir, filename, as_attachment=True)
 
@@ -257,33 +241,38 @@ def process_command():
     user.lang = data.get('lang', user.lang)
     target_lang_name = LANGUAGES.get(user.lang, "English")
 
-    if not query: return jsonify({"status": "info", "message": "Listening..."})
+    if not query: return jsonify({"status": "info", "message": "Ready."})
 
-    parts = query.lower().split(' ', 1)
-    action = parts[0]
+    # FIX: Don't lowercase the whole query, as filenames are case-sensitive
+    parts = query.split(' ', 1)
+    action = parts[0].lower()
     
     if action in ['open', 'read', 'run', 'execute', 'summarize', 'transcribe', 'create'] and len(parts) > 1:
-        filename = secure_filename(parts[1].strip().split()[0])
+        # Get raw filename to preserve case
+        raw_filename = parts[1].strip().split()[0]
+        filename = secure_filename(raw_filename)
         path = os.path.join(user.workspace, filename)
         
         if action == "open":
             all_files = get_workspace_files(sid)
-            if os.path.exists(path) or filename in all_files:
+            # CASE-INSENSITIVE SEARCH
+            matched_file = next((f for f in all_files if f.lower() == filename.lower()), None)
+            
+            if os.path.exists(path) or matched_file:
+                final_name = matched_file if matched_file else filename
                 return jsonify({
                     "status": "success", "action": "open_url", 
-                    "url": f"/download/{sid}/{filename}", 
-                    "message": f"Opening {filename}..."
+                    "url": f"/download/{sid}/{final_name}", 
+                    "message": f"Opening {final_name}..."
                 })
             return jsonify({"status": "error", "message": f"File '{filename}' not found."})
 
         if action == "read":
-            # Sync from bucket if missing locally before reading
-            if not os.path.exists(path) and storage and storage.supabase:
+            if not os.path.exists(path) and storage:
                 try:
                     res = storage.supabase.storage.from_('workspace-bucket').download(f"{sid}/{filename}")
                     with open(path, 'wb') as f: f.write(res)
                 except: pass
-            
             content = extract_text(path, user)
             user.content = content
             user.read_pos = 0
@@ -301,26 +290,19 @@ def process_command():
         try:
             response = api_manager.execute_with_retry(model.generate_content, f"Query: {query}")
             is_fc = bool(response.candidates[0].content.parts[0].function_call)
-            
             if is_fc:
                 fc = response.candidates[0].content.parts[0].function_call
                 args = dict(fc.args)
                 if fc.name == "manage_file":
-                    return jsonify({"status": "success", "action": "open_url", "url": f"/download/{sid}/{args['filename']}", "message": "Processing..."})
+                    return jsonify({"status": "success", "action": "open_url", "url": f"/download/{sid}/{args['filename']}", "message": "Opening..."})
                 if fc.name == "create_new_file":
                     res = file_creator.create_workspace_file(args['filename'], args['prompt'], user.workspace, target_lang=target_lang_name)
                     if res['status'] == 'success':
                         upload_to_bucket(sid, args['filename'], os.path.join(user.workspace, args['filename']))
                     return jsonify(res)
-                if fc.name == "ask_document":
-                    if not user.vector_store: return jsonify({"status": "error", "message": "Index doc first."})
-                    ans = rag_service.query_rag_document(args.get('question', query), user.vector_store)
-                    return jsonify({"status": "success", "message": ans})
-
             return jsonify({"status": "info", "message": response.text})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)})
-    
     return jsonify({"status": "error", "message": "System Error."})
 
 @app.route('/read_chunk')
