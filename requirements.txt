@@ -12,3 +12,5 @@ moviepy
 speechrecognition
 eventlet
 gunicorn
+yt-dlp
+werkzeug
